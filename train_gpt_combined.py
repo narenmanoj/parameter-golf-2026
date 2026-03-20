@@ -28,6 +28,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    from triton_kernels import fused_residmix_rmsnorm, fused_residadd_rmsnorm, fused_smeargate_rmsnorm
+    HAS_TRITON_KERNELS = True
+except ImportError:
+    HAS_TRITON_KERNELS = False
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -765,14 +771,24 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, x0: Tensor, attn_scale: Tensor, mlp_scale: Tensor,
                 resid_mix: Tensor, q_delta_fn=None, v_delta_fn=None) -> Tensor:
-        mix = resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        n = self.attn_norm(x)
+        if HAS_TRITON_KERNELS:
+            # Fused: residual mix + RMSNorm (saves 2 kernel launches + 2 memory round-trips)
+            mixed, n = fused_residmix_rmsnorm(x, x0, resid_mix[0], resid_mix[1])
+            x = mixed
+        else:
+            mix = resid_mix.to(dtype=x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+            n = self.attn_norm(x)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
         attn_out = self.attn(n, qd, vd)
-        x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if HAS_TRITON_KERNELS:
+            # Fused: residual add + RMSNorm (saves 2 kernel launches + 2 memory round-trips)
+            x, mlp_input = fused_residadd_rmsnorm(x, attn_out, attn_scale)
+        else:
+            x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            mlp_input = self.mlp_norm(x)
+        x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_input)
         return x
 
 
@@ -871,8 +887,11 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None) -> Tensor:
         x = self.tok_emb(input_ids)
-        x = self._apply_smear_gate(x)
-        x = F.rms_norm(x, (x.size(-1),))
+        if HAS_TRITON_KERNELS:
+            x = fused_smeargate_rmsnorm(x, self.smear_gate)
+        else:
+            x = self._apply_smear_gate(x)
+            x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
@@ -923,8 +942,11 @@ class GPT(nn.Module):
     def logits_only(self, input_ids: Tensor) -> Tensor:
         """Forward pass returning raw logits (no loss computation)."""
         x = self.tok_emb(input_ids)
-        x = self._apply_smear_gate(x)
-        x = F.rms_norm(x, (x.size(-1),))
+        if HAS_TRITON_KERNELS:
+            x = fused_smeargate_rmsnorm(x, self.smear_gate)
+        else:
+            x = self._apply_smear_gate(x)
+            x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
@@ -1237,6 +1259,7 @@ def main() -> None:
         console=False,
     )
     log0("=" * 100, console=False)
+    log0(f"Fused Triton kernels: {'ENABLED' if HAS_TRITON_KERNELS else 'disabled (fallback to PyTorch)'}")
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
