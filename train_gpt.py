@@ -1149,6 +1149,7 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_names: list[str] = ["tok", "muon", "scalar"]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1157,6 +1158,7 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+        optimizer_names.insert(1, "head")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} logical_layers:{base_model.num_layers} unique_layers:{base_model.num_unique_layers}")
@@ -1296,18 +1298,32 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        for opt in optimizers:
-            opt.step()
-        zero_grad_all()
-
+        # Compute grad norms only on logging steps to avoid overhead.
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
+        grad_norm_total = None
+        if should_log_train and tb_writer is not None:
+            total_sq = 0.0
+            for opt, name in zip(optimizers, optimizer_names):
+                group_sq = 0.0
+                for group in opt.param_groups:
+                    for p in group["params"]:
+                        if p.grad is not None:
+                            group_sq += p.grad.data.float().norm().item() ** 2
+                tb_writer.add_scalar(f"grad_norm/{name}", group_sq ** 0.5, step)
+                total_sq += group_sq
+            grad_norm_total = total_sq ** 0.5
+
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        for opt in optimizers:
+            opt.step()
+        zero_grad_all()
+
         if should_log_train:
             tl = train_loss.item()
             log0(
@@ -1318,6 +1334,10 @@ def main() -> None:
                 tb_writer.add_scalar("train/loss", tl, step)
                 tb_writer.add_scalar("train/step_avg_ms", approx_training_time_ms / step, step)
                 tb_writer.add_scalar("train/lr_scale", scale, step)
+                if grad_norm_total is not None:
+                    tb_writer.add_scalar("grad_norm/total", grad_norm_total, step)
+                for opt, name in zip(optimizers, optimizer_names):
+                    tb_writer.add_scalar(f"lr/{name}", opt.param_groups[0]["lr"], step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
