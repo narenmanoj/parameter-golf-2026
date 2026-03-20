@@ -81,17 +81,19 @@ class FusedResidMixRMSNorm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_mixed: Tensor, grad_out: Tensor):
         x_flat, x0_flat, mixed, mix0, mix1 = ctx.saved_tensors
-        # Fall back to PyTorch for backward (still get the forward fusion benefit)
-        mixed_f = mixed.float().requires_grad_(True)
-        with torch.enable_grad():
-            var = (mixed_f * mixed_f).mean(dim=-1, keepdim=True)
-            rrms = torch.rsqrt(var + ctx.eps)
-            normed = mixed_f * rrms
-        grad_out_flat = grad_out.reshape(-1, x_flat.shape[-1])
-        grad_mixed_from_norm = torch.autograd.grad(normed, mixed_f, grad_out_flat)[0]
+        D = x_flat.shape[-1]
+
+        # Manual RMSNorm backward (avoids requires_grad_ for torch.compile compat)
+        mixed_f = mixed.float()
+        var = (mixed_f * mixed_f).mean(dim=-1, keepdim=True)
+        rrms = torch.rsqrt(var + ctx.eps)
+        normed = mixed_f * rrms
+        grad_out_flat = grad_out.reshape(-1, D).float()
+        # d/dx RMSNorm: (grad - normed * mean(grad * normed)) * rrms
+        grad_mixed_from_norm = (grad_out_flat - normed * (grad_out_flat * normed).mean(dim=-1, keepdim=True)) * rrms
 
         # Combine gradients: mixed gets grad from both paths
-        total_grad_mixed = grad_mixed_from_norm + grad_mixed.reshape(-1, x_flat.shape[-1]).float()
+        total_grad_mixed = grad_mixed_from_norm + grad_mixed.reshape(-1, D).float()
 
         m0 = mix0.float()
         m1 = mix1.float()
@@ -169,14 +171,13 @@ class FusedResidAddRMSNorm(torch.autograd.Function):
         x_flat, attn_flat, x_new, scale = ctx.saved_tensors
         D = x_flat.shape[-1]
 
-        # Backward through RMSNorm (PyTorch fallback)
-        x_new_f = x_new.float().requires_grad_(True)
-        with torch.enable_grad():
-            var = (x_new_f * x_new_f).mean(dim=-1, keepdim=True)
-            rrms = torch.rsqrt(var + ctx.eps)
-            normed_recomp = x_new_f * rrms
-        grad_normed_flat = grad_normed.reshape(-1, D)
-        grad_x_new_from_norm = torch.autograd.grad(normed_recomp, x_new_f, grad_normed_flat)[0]
+        # Manual RMSNorm backward (avoids requires_grad_ for torch.compile compat)
+        x_new_f = x_new.float()
+        var = (x_new_f * x_new_f).mean(dim=-1, keepdim=True)
+        rrms = torch.rsqrt(var + ctx.eps)
+        normed_recomp = x_new_f * rrms
+        grad_normed_flat = grad_normed.reshape(-1, D).float()
+        grad_x_new_from_norm = (grad_normed_flat - normed_recomp * (grad_normed_flat * normed_recomp).mean(dim=-1, keepdim=True)) * rrms
 
         # Combine grads: x_new gets grad from both outputs
         total_grad_x_new = grad_x_new_from_norm + grad_x_new.reshape(-1, D).float()
@@ -266,19 +267,19 @@ class FusedSmearGateRMSNorm(torch.autograd.Function):
         gate = torch.sigmoid(raw_gate.float())[None, None, :]  # (1, 1, D)
         x_f = x.float()
         prev = torch.nn.functional.pad(x_f[:, :-1, :], (0, 0, 1, 0))
-        smeared = ((1.0 - gate) * x_f + gate * prev).requires_grad_(True)
+        smeared = (1.0 - gate) * x_f + gate * prev
 
-        with torch.enable_grad():
-            var = (smeared * smeared).mean(dim=-1, keepdim=True)
-            rrms = torch.rsqrt(var + ctx.eps)
-            normed = smeared * rrms
-        grad_smeared = torch.autograd.grad(normed, smeared, grad_out.float())[0]
+        # Manual RMSNorm backward (avoids requires_grad_ for torch.compile compat)
+        var = (smeared * smeared).mean(dim=-1, keepdim=True)
+        rrms = torch.rsqrt(var + ctx.eps)
+        normed = smeared * rrms
+        grad_out_f = grad_out.float()
+        grad_smeared = (grad_out_f - normed * (grad_out_f * normed).mean(dim=-1, keepdim=True)) * rrms
 
         # Backward through smear: smeared = (1-gate)*x + gate*prev
-        gate_val = torch.sigmoid(raw_gate.float())[None, None, :]
-        grad_x = grad_smeared * (1.0 - gate_val)
+        grad_x = grad_smeared * (1.0 - gate)
         # prev contributions shift back: grad_x[:, t-1] += grad_smeared[:, t] * gate
-        grad_x[:, :-1, :] += grad_smeared[:, 1:, :] * gate_val
+        grad_x[:, :-1, :] = grad_x[:, :-1, :] + grad_smeared[:, 1:, :] * gate
 
         # Gradient for raw_gate (through sigmoid)
         sig = torch.sigmoid(raw_gate.float())
