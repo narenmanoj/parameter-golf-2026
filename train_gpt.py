@@ -1018,12 +1018,18 @@ def main() -> None:
     logfile = None
     tb_writer = None
     if master_process:
-        os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{args.run_id}.txt"
-        print(logfile)
+        run_dir = f"logs/{args.run_id}"
+        os.makedirs(run_dir, exist_ok=True)
+        logfile = f"{run_dir}/train.txt"
+        print(run_dir)
+        # Dump all hyperparameters for reproducibility.
+        with open(f"{run_dir}/config.txt", "w", encoding="utf-8") as f:
+            for k, v in sorted(vars(type(args)).items()):
+                if not k.startswith("_") and not callable(v):
+                    f.write(f"{k}={getattr(args, k)}\n")
         try:
             from torch.utils.tensorboard import SummaryWriter
-            tb_writer = SummaryWriter(log_dir=f"logs/tb_{args.run_id}")
+            tb_writer = SummaryWriter(log_dir=f"{run_dir}/tb")
         except ImportError:
             pass
 
