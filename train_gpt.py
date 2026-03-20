@@ -1016,10 +1016,16 @@ def main() -> None:
     enable_math_sdp(False)
 
     logfile = None
+    tb_writer = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
         print(logfile)
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_writer = SummaryWriter(log_dir=f"logs/tb_{args.run_id}")
+        except ImportError:
+            pass
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
@@ -1147,7 +1153,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params}")
+    log0(f"model_params:{n_params} logical_layers:{base_model.num_layers} unique_layers:{base_model.num_unique_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1247,6 +1253,9 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if tb_writer is not None:
+                tb_writer.add_scalar("val/loss", val_loss, step)
+                tb_writer.add_scalar("val/bpb", val_bpb, step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1294,10 +1303,15 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            tl = train_loss.item()
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step:{step}/{args.iterations} train_loss:{tl:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if tb_writer is not None:
+                tb_writer.add_scalar("train/loss", tl, step)
+                tb_writer.add_scalar("train/step_avg_ms", approx_training_time_ms / step, step)
+                tb_writer.add_scalar("train/lr_scale", scale, step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1385,6 +1399,10 @@ def main() -> None:
         f"final_int8_ttt_lora val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
     )
+    if tb_writer is not None:
+        tb_writer.add_scalar("final/int8_zlib_val_bpb", q_val_bpb, 0)
+        tb_writer.add_scalar("final/int8_ttt_lora_val_bpb", ttt_val_bpb, 0)
+        tb_writer.close()
 
     if distributed:
         dist.destroy_process_group()
