@@ -79,6 +79,7 @@ class Hyperparameters:
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 0))  # 0 = no sharing (same as num_layers)
     mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 2))  # extra future-token prediction heads (0 = disabled)
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.1))  # weight for MTP auxiliary loss
+    smear_gate_init = float(os.environ.get("SMEAR_GATE_INIT", -3.0))  # init value for smear gate (sigmoid(-3)≈0.05)
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -808,6 +809,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         num_unique_layers: int = 0,
         mtp_num_heads: int = 0,
+        smear_gate_init: float = -3.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -850,7 +852,7 @@ class GPT(nn.Module):
             [nn.Parameter(torch.stack((torch.ones(model_dim), torch.zeros(model_dim))).float()) for _ in range(num_layers)]
         )
         # SmearGate: learned per-dim gate blending each token embedding with the previous token's.
-        self.smear_gate = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
+        self.smear_gate = nn.Parameter(torch.full((model_dim,), smear_gate_init, dtype=torch.float32))
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1305,6 +1307,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         num_unique_layers=args.num_unique_layers,
         mtp_num_heads=args.mtp_num_heads,
+        smear_gate_init=args.smear_gate_init,
     ).to(device).bfloat16()
     base_model.mtp_loss_weight = args.mtp_loss_weight
     for module in base_model.modules():
